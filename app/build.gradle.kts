@@ -67,6 +67,12 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        // These prebuilt AndroidX native libs ship without symbols we can strip on CI;
+        // marking them explicitly keeps AGP from trying (and warning) on every build.
+        jniLibs {
+            keepDebugSymbols += "**/libandroidx.graphics.path.so"
+            keepDebugSymbols += "**/libdatastore_shared_counter.so"
+        }
     }
 }
 
