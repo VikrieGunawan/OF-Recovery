@@ -86,7 +86,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-private sealed interface PhoneMatch {
+sealed interface PhoneMatch {
     data object Checking : PhoneMatch
     data object NotFound : PhoneMatch
     data class Found(val device: Device) : PhoneMatch
