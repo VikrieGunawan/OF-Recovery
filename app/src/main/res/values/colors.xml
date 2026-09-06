@@ -2,4 +2,5 @@
     <color name="fox_orange">#FF6D00</color>
     <color name="fox_orange_deep">#E65100</color>
     <color name="fox_dark_background">#1A1310</color>
+    <color name="ic_launcher_background">#101012</color>
 </resources>
