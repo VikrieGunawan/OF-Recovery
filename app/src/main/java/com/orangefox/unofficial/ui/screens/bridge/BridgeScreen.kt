@@ -17,6 +17,7 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CloudDone
 import androidx.compose.material.icons.rounded.CloudOff
 import androidx.compose.material.icons.rounded.HourglassTop
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -33,6 +34,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -42,7 +44,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.orangefox.unofficial.FoxApp
+import com.orangefox.unofficial.data.api.DeviceParser
 import com.orangefox.unofficial.data.api.FoxApiClient
+import com.orangefox.unofficial.data.model.BridgeUptime
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -67,25 +72,40 @@ data class EndpointHealth(
     val error: String?
 )
 
-/** Every server the app can bridge with — keep in sync with the README. */
+/**
+ * Real connectivity checks, verified against the live infrastructure:
+ *  - The REST API lives on the host ROOT (no /v3 prefix): /replies, /releases, /uptime...
+ *  - Release files download through mirrors.DL -> /release/{id}/dl (a bare GET
+ *    with a Range header returns HTTP 206 for 1 KiB — used to prove the
+ *    download pipeline without pulling a whole 55 MB zip).
+ *  - dl.orangefox.download is legacy: its root answers HTTP 502, so the app
+ *    never probes it again.
+ */
 object OrangeEndpoints {
     val all = listOf(
-        BridgeEndpoint("API Server", "Device catalog & release data (REST)", "https://api.orangefox.download/v3/device/"),
-        BridgeEndpoint("Download Server", "Hosts the recovery image files", "https://dl.orangefox.download/"),
+        BridgeEndpoint("API Server", "Devices, releases & uptime (REST, no /v3 prefix)", "https://api.orangefox.download/releases?limit=1"),
         BridgeEndpoint("Main Website", "Device pages & web downloads", "https://orangefox.download/"),
         BridgeEndpoint("Wiki", "Installation guides & documentation", "https://wiki.orangefox.download/"),
         BridgeEndpoint("GitLab", "Source code & build pipelines", "https://gitlab.com/OrangeFox")
     )
 }
 
+data class BridgeState(
+    val uptime: BridgeUptime? = null,
+    val uptimeError: String? = null,
+    val uptimeLatencyMs: Long? = null,
+    val endpointHealth: Map<String, EndpointHealth> = emptyMap(),
+    val downloadCheck: EndpointHealth? = null
+)
+
 class BridgeViewModel(application: Application) : AndroidViewModel(application) {
 
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .callTimeout(8, TimeUnit.SECONDS)
+        .callTimeout(10, TimeUnit.SECONDS)
         .build()
 
-    private val _health = MutableStateFlow<Map<String, EndpointHealth>>(emptyMap())
-    val health: StateFlow<Map<String, EndpointHealth>> = _health.asStateFlow()
+    private val _state = MutableStateFlow(BridgeState())
+    val state: StateFlow<BridgeState> = _state.asStateFlow()
 
     private val _running = MutableStateFlow(false)
     val running: StateFlow<Boolean> = _running.asStateFlow()
@@ -94,12 +114,47 @@ class BridgeViewModel(application: Application) : AndroidViewModel(application) 
         if (_running.value) return
         viewModelScope.launch {
             _running.value = true
-            _health.value = emptyMap()
-            for (endpoint in OrangeEndpoints.all) {
-                val result = withContext(Dispatchers.IO) { probe(endpoint) }
-                _health.value = _health.value + (endpoint.name to result)
+            _state.value = BridgeState()
+            // +1 accounts for the download-pipeline probe.
+            val pending = java.util.concurrent.atomic.AtomicInteger(OrangeEndpoints.all.size + 1)
+
+            // 1) Official aggregated status (GET /uptime).
+            withContext(Dispatchers.IO) {
+                val startedAt = System.currentTimeMillis()
+                try {
+                    val app = getApplication<FoxApp>()
+                    val raw = app.apiService.getUptime().use { it.string() }
+                    val parsed = DeviceParser.parseUptime(raw)
+                    _state.value = _state.value.copy(
+                        uptime = parsed,
+                        uptimeLatencyMs = System.currentTimeMillis() - startedAt,
+                        uptimeError = if (parsed == null) "Could not parse the /uptime response" else null
+                    )
+                } catch (e: Exception) {
+                    _state.value = _state.value.copy(
+                        uptimeError = e.message ?: "unreachable"
+                    )
+                }
             }
-            _running.value = false
+
+            // 2) Probe the reachable endpoints in parallel.
+            OrangeEndpoints.all.forEach { endpoint ->
+                viewModelScope.launch {
+                    val result = withContext(Dispatchers.IO) { probe(endpoint) }
+                    _state.value = _state.value.copy(
+                        endpointHealth = _state.value.endpointHealth + (endpoint.name to result)
+                    )
+                    if (pending.decrementAndGet() == 0) _running.value = false
+                }
+            }
+
+            // 3) Prove the download pipeline: resolve one real release mirror
+            //    and pull 1 KiB of it (HTTP 206 = download server works).
+            viewModelScope.launch {
+                val result = withContext(Dispatchers.IO) { probeDownloadPipeline() }
+                _state.value = _state.value.copy(downloadCheck = result)
+                if (pending.decrementAndGet() == 0) _running.value = false
+            }
         }
     }
 
@@ -109,6 +164,7 @@ class BridgeViewModel(application: Application) : AndroidViewModel(application) 
             val request = Request.Builder()
                 .url(endpoint.url)
                 .header("User-Agent", FoxApiClient.USER_AGENT)
+                .header("Accept", "application/json, text/html;q=0.8, */*;q=0.5")
                 .build()
             client.newCall(request).execute().use { response ->
                 EndpointHealth(
@@ -129,19 +185,73 @@ class BridgeViewModel(application: Application) : AndroidViewModel(application) 
             )
         }
     }
+
+    private fun probeDownloadPipeline(): EndpointHealth {
+        val endpoint = BridgeEndpoint(
+            "Download pipeline",
+            "1 KiB range fetch of a real release mirror (mirrors.DL)",
+            "https://api.orangefox.download/release/{id}/dl"
+        )
+        val startedAt = System.currentTimeMillis()
+        return try {
+            // Resolve the newest release mirror first.
+            val listRequest = Request.Builder()
+                .url("https://api.orangefox.download/releases?limit=1")
+                .header("User-Agent", FoxApiClient.USER_AGENT)
+                .build()
+            val mirror = client.newCall(listRequest).execute().use { response ->
+                if (!response.isSuccessful) return EndpointHealth(
+                    endpoint, false, System.currentTimeMillis() - startedAt, response.code, "mirror lookup HTTP ${response.code}"
+                )
+                val body = response.body?.string().orEmpty()
+                Regex("\"mirrors\"\\s*:\\s*\\{\\s*\"DL\"\\s*:\\s*\"([^\"]+)\"")
+                    .find(body)?.groupValues?.get(1)
+                    ?: return EndpointHealth(
+                        endpoint, false, System.currentTimeMillis() - startedAt, response.code, "no DL mirror in response"
+                    )
+            }
+            val downloadRequest = Request.Builder()
+                .url(mirror)
+                .header("User-Agent", FoxApiClient.USER_AGENT)
+                .header("Range", "bytes=0-1023")
+                .build()
+            client.newCall(downloadRequest).execute().use { response ->
+                val ok = response.code == 206 || response.code == 200
+                EndpointHealth(
+                    endpoint = endpoint,
+                    online = ok,
+                    latencyMs = System.currentTimeMillis() - startedAt,
+                    httpCode = response.code,
+                    error = if (ok) null else "HTTP ${response.code}"
+                )
+            }
+        } catch (e: Exception) {
+            EndpointHealth(
+                endpoint = endpoint,
+                online = false,
+                latencyMs = System.currentTimeMillis() - startedAt,
+                httpCode = null,
+                error = e.message ?: "unreachable"
+            )
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BridgeScreen(onBack: () -> Unit) {
     val vm: BridgeViewModel = viewModel()
-    val health by vm.health.collectAsStateWithLifecycle()
+    val state by vm.state.collectAsStateWithLifecycle()
     val running by vm.running.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) { vm.checkAll() }
 
-    val onlineCount = health.values.count { it.online }
-    val knownCount = health.size
+    val downloadCheck = state.downloadCheck
+    val probes = OrangeEndpoints.all + listOfNotNull(downloadCheck?.endpoint)
+    val healthMap = remember(state) {
+        state.endpointHealth + (downloadCheck?.let { it.endpoint.name to it }?.let { mapOf(it) } ?: emptyMap())
+    }
+    val onlineCount = probes.count { healthMap[it.name]?.online == true }
 
     Scaffold(
         topBar = {
@@ -171,8 +281,22 @@ fun BridgeScreen(onBack: () -> Unit) {
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text("OrangeFox bridge status", style = MaterialTheme.typography.titleLarge)
+                        val uptime = state.uptime
                         Text(
-                            if (running) "Probing every OrangeFox endpoint…" else "$onlineCount / ${OrangeEndpoints.all.size} endpoints online",
+                            when {
+                                running && uptime == null -> "Asking the official /uptime endpoint…"
+                                uptime != null -> buildString {
+                                    append("Official status: ${uptime.status ?: "unknown"}")
+                                    append(uptime.role?.let { " ($it)" } ?: "")
+                                    append(" — ${uptime.hosts.count { it.isOk == true }}/${uptime.hosts.size} hosts up")
+                                    state.uptimeLatencyMs?.let { append(" · ${it} ms") }
+                                }
+                                else -> "Official status unavailable: ${state.uptimeError ?: "unknown error"}"
+                            },
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            "$onlineCount / ${probes.size} app checks online",
                             style = MaterialTheme.typography.bodyMedium
                         )
                         if (running) {
@@ -185,11 +309,67 @@ fun BridgeScreen(onBack: () -> Unit) {
                 }
             }
 
-            items(OrangeEndpoints.all, key = { it.name }) { endpoint ->
-                EndpointCard(endpoint, health[endpoint.name])
+            // Official infrastructure hosts reported by the API itself.
+            if (state.uptime != null) {
+                item { SectionLabel("Official infrastructure (GET /uptime)") }
+                items(state.uptime!!.hosts, key = { "host_${it.nickname}" }) { host ->
+                    HostCard(host)
+                }
+            }
+
+            // App-side probes.
+            item { SectionLabel("Connectivity checks from this device") }
+            items(probes, key = { it.name }) { endpoint ->
+                EndpointCard(endpoint, healthMap[endpoint.name])
             }
 
             item { RequirementsCard() }
+        }
+    }
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.titleMedium,
+        color = MaterialTheme.colorScheme.primary
+    )
+}
+
+@Composable
+private fun HostCard(host: com.orangefox.unofficial.data.model.BridgeHost) {
+    Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                when {
+                    host.isOk == true -> Icons.Rounded.CloudDone
+                    host.isOk == false && host.isOptional != true -> Icons.Rounded.CloudOff
+                    host.isOk == false -> Icons.Rounded.CloudOff
+                    else -> Icons.Rounded.HourglassTop
+                },
+                contentDescription = null,
+                tint = when {
+                    host.isOk == true -> MaterialTheme.colorScheme.primary
+                    host.isOk == false && host.isOptional == true -> MaterialTheme.colorScheme.tertiary
+                    host.isOk == false -> MaterialTheme.colorScheme.error
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                modifier = Modifier.size(24.dp)
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(host.nickname, style = MaterialTheme.typography.titleMedium, fontFamily = FontFamily.Monospace)
+                host.errorText?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
+            if (host.isOptional == true) {
+                AssistChip(onClick = {}, label = { Text("optional") })
+            }
         }
     }
 }
@@ -272,12 +452,12 @@ private fun RequirementsCard() {
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text("What does the bridge need?", style = MaterialTheme.typography.titleMedium)
-            Requirement("HTTPS connectivity to api.orangefox.download, dl.orangefox.download, orangefox.download, wiki.orangefox.download and gitlab.com/OrangeFox")
+            Requirement("HTTPS connectivity to api.orangefox.download (REST + release downloads), orangefox.download, wiki.orangefox.download and gitlab.com/OrangeFox")
             Requirement("INTERNET and ACCESS_NETWORK_STATE permissions in the manifest")
             Requirement("An HTTP client with timeouts, a clear User-Agent and graceful failure handling (no API key needed — the OrangeFox API is public)")
+            Requirement("The official /uptime endpoint for authoritative infrastructure status instead of guessing from root URLs")
             Requirement("Tolerant JSON parsing so schema changes on the server never crash the app")
             Requirement("A local Room cache plus a bundled offline catalog, so the app still works when a server is down")
-            Requirement("A configurable base URL (Settings) in case OrangeFox ever moves its API")
         }
     }
 }
