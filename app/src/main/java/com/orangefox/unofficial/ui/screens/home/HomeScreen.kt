@@ -1,5 +1,6 @@
 package com.orangefox.unofficial.ui.screens.home
 
+import android.widget.Toast
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -33,10 +35,11 @@ import androidx.compose.material.icons.rounded.Smartphone
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LargeTopAppBar
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -48,22 +51,95 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.lerp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import coil.compose.AsyncImage
 import com.orangefox.unofficial.FoxApp
 import com.orangefox.unofficial.R
 import com.orangefox.unofficial.data.model.Device
+import com.orangefox.unofficial.data.model.FoxBuild
+import com.orangefox.unofficial.data.repo.FoxRepository
+import com.orangefox.unofficial.ui.components.BuildCard
 import com.orangefox.unofficial.ui.components.SectionTitle
+import com.orangefox.unofficial.util.DownloadHelper
 import com.orangefox.unofficial.util.openInBrowser
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+
+private sealed interface PhoneMatch {
+    data object Checking : PhoneMatch
+    data object NotFound : PhoneMatch
+    data class Found(val device: Device) : PhoneMatch
+}
+
+class HomeViewModel(private val repo: FoxRepository) : ViewModel() {
+
+    private val _match = MutableStateFlow<PhoneMatch>(PhoneMatch.Checking)
+    val match: StateFlow<PhoneMatch> = _match.asStateFlow()
+
+    private val _latest = MutableStateFlow<List<FoxBuild>>(emptyList())
+    val latest: StateFlow<List<FoxBuild>> = _latest.asStateFlow()
+
+    private val _latestNote = MutableStateFlow<String?>(null)
+    val latestNote: StateFlow<String?> = _latestNote.asStateFlow()
+
+    private val _loadingLatest = MutableStateFlow(false)
+    val loadingLatest: StateFlow<Boolean> = _loadingLatest.asStateFlow()
+
+    init {
+        viewModelScope.launch { repo.seedOfflineIfEmpty() }
+        loadLatest()
+        resolvePhone()
+    }
+
+    fun loadLatest() {
+        if (_loadingLatest.value) return
+        viewModelScope.launch {
+            _loadingLatest.value = true
+            _latest.value = repo.latestReleases(limit = 8)
+            _latestNote.value =
+                if (_latest.value.isEmpty()) "The bridge returned no releases right now — the app keeps working from its cache." else null
+            _loadingLatest.value = false
+        }
+    }
+
+    private fun resolvePhone() {
+        viewModelScope.launch {
+            _match.value = repo.matchThisPhone()
+                ?.let { PhoneMatch.Found(it) }
+                ?: PhoneMatch.NotFound
+        }
+    }
+
+    companion object {
+        val Factory = viewModelFactory {
+            initializer {
+                val app = this[ViewModelProvider.AndroidViewModelFactory.APPLICATION_KEY] as FoxApp
+                HomeViewModel(app.repository)
+            }
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -75,26 +151,34 @@ fun HomeScreen(
     onOpenSettings: () -> Unit,
     onDeviceClick: (String) -> Unit
 ) {
-    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    val vm: HomeViewModel = viewModel(factory = HomeViewModel.Factory)
+    val match by vm.match.collectAsStateWithLifecycle()
+    val latest by vm.latest.collectAsStateWithLifecycle()
+    val latestNote by vm.latestNote.collectAsStateWithLifecycle()
+    val loadingLatest by vm.loadingLatest.collectAsStateWithLifecycle()
     val app = LocalContext.current.applicationContext as FoxApp
     val devices by app.repository.cachedDevices.collectAsStateWithLifecycle(initialValue = emptyList())
 
-    LaunchedEffect(Unit) { app.repository.seedOfflineIfEmpty() }
+    // Custom collapsing header: the fraction drives every part of the animation
+    // continuously (no pinned title, no abrupt jump to the left edge).
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    val density = LocalDensity.current
+    LaunchedEffect(density) {
+        val expanded = with(density) { 148.dp.toPx() }
+        val collapsed = with(density) { 64.dp.toPx() }
+        scrollBehavior.state.heightOffsetLimit = -(expanded - collapsed)
+    }
+    val fraction = scrollBehavior.state.collapsedFraction.coerceIn(0f, 1f)
 
     Scaffold(
-        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
+        modifier = Modifier
+            .fillMaxSize()
+            .nestedScroll(scrollBehavior.nestedScrollConnection),
         topBar = {
-            LargeTopAppBar(
-                title = { Text(stringResource(R.string.app_name)) },
-                actions = {
-                    IconButton(onClick = onOpenBridge) {
-                        Icon(Icons.Rounded.NetworkCheck, contentDescription = stringResource(R.string.bridge_health))
-                    }
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Rounded.Settings, contentDescription = stringResource(R.string.settings))
-                    }
-                },
-                scrollBehavior = scrollBehavior
+            FoxHomeHeader(
+                fraction = fraction,
+                onOpenBridge = onOpenBridge,
+                onOpenSettings = onOpenSettings
             )
         }
     ) { padding ->
@@ -104,6 +188,9 @@ fun HomeScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             item { HeroCard() }
+
+            item { YourDeviceCard(match, onOpenDevices, onDeviceClick) }
+
             item {
                 QuickActionsGrid(
                     onChecker = onOpenChecker,
@@ -112,13 +199,155 @@ fun HomeScreen(
                     onBridge = onOpenBridge
                 )
             }
-            item { StatsCard(devices.size, onOpenDevices) }
+
+            item { SectionTitle("Latest from the bridge") }
+
+            if (loadingLatest && latest.isEmpty()) {
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Text(
+                            "Fetching the newest OrangeFox releases…",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+            }
+
+            latestNote?.let { note ->
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.large,
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Text(
+                            note,
+                            modifier = Modifier.padding(14.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            items(latest, key = { it.fileUrl ?: it.displayName }) { build ->
+                BuildCard(
+                    build = build,
+                    onDownload = {
+                        val context = app
+                        val url = build.fileUrl ?: return@BuildCard
+                        val name = build.displayName.ifBlank {
+                            "orangefox-${System.currentTimeMillis()}.zip"
+                        }
+                        runCatching {
+                            DownloadHelper.enqueue(context, url, name)
+                            Toast.makeText(
+                                context,
+                                "Download started — see the Downloads tab",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }.onFailure {
+                            Toast.makeText(context, "Could not start the download", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    onOpen = { build.fileUrl?.let { openInBrowser(app, it) } }
+                )
+            }
+
             if (devices.isNotEmpty()) {
                 item { SectionTitle("Featured devices") }
                 item { FeaturedCarousel(devices, onDeviceClick) }
             }
+
             item { LinksCard() }
             item { DisclaimerCard() }
+        }
+    }
+}
+
+/**
+ * Home-grown collapsing header. The large title slides up and fades out while
+ * the compact title fades in — one continuous motion driven by the scroll
+ * fraction, so nothing ever "teleports" to the left edge.
+ */
+@Composable
+private fun FoxHomeHeader(
+    fraction: Float,
+    onOpenBridge: () -> Unit,
+    onOpenSettings: () -> Unit
+) {
+    val bg = MaterialTheme.colorScheme.surface
+    val hairline = MaterialTheme.colorScheme.outlineVariant
+    val largeAlpha = (1f - fraction * 1.5f).coerceIn(0f, 1f)
+    val smallAlpha = (fraction * 1.7f - 0.4f).coerceIn(0f, 1f)
+    val density = LocalDensity.current
+    val hairlinePx = with(density) { 1.dp.toPx() }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(bg)
+            .drawBehind {
+                if (fraction > 0.08f) {
+                    drawLine(
+                        color = hairline,
+                        start = Offset(0f, size.height),
+                        end = Offset(size.width, size.height),
+                        strokeWidth = hairlinePx
+                    )
+                }
+            }
+            .statusBarsPadding()
+            .height(lerp(148.dp, 64.dp, fraction))
+            .padding(horizontal = 16.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(64.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "OF Recovery",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.graphicsLayer { alpha = smallAlpha }
+            )
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = onOpenBridge) {
+                Icon(Icons.Rounded.NetworkCheck, contentDescription = "Bridge Health")
+            }
+            IconButton(onClick = onOpenSettings) {
+                Icon(Icons.Rounded.Settings, contentDescription = "Settings")
+            }
+        }
+        Box(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            contentAlignment = Alignment.BottomStart
+        ) {
+            Column(
+                modifier = Modifier
+                    .graphicsLayer {
+                        alpha = largeAlpha
+                        translationY = -fraction * with(density) { 40.dp.toPx() }
+                    }
+                    .padding(bottom = 14.dp)
+            ) {
+                Text(
+                    "OF Recovery",
+                    style = MaterialTheme.typography.headlineMedium
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "Unofficial OrangeFox Recovery companion",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }
@@ -165,7 +394,7 @@ private fun HeroCard() {
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Unofficial companion — browse supported devices, download builds and check your own recovery.",
+                    "Browse supported devices, download builds, check your recovery and watch the bridge — all live from the official servers.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
@@ -191,6 +420,78 @@ private fun HeroCard() {
 }
 
 @Composable
+private fun YourDeviceCard(
+    match: PhoneMatch,
+    onOpenDevices: () -> Unit,
+    onDeviceClick: (String) -> Unit
+) {
+    Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.large) {
+        when (match) {
+            is PhoneMatch.Checking -> Row(
+                modifier = Modifier.padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                Text("Identifying your phone…", style = MaterialTheme.typography.bodyMedium)
+            }
+
+            is PhoneMatch.Found -> Row(
+                modifier = Modifier.padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Rounded.Smartphone,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "This phone is supported: ${match.device.name}",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        "${match.device.oem} · ${match.device.codename} — tap to see its OrangeFox releases",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                androidx.compose.material3.TextButton(onClick = { onDeviceClick(match.device.codename) }) {
+                    Text("Open")
+                }
+            }
+
+            is PhoneMatch.NotFound -> Row(
+                modifier = Modifier.padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Rounded.Smartphone,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "Your phone wasn't matched automatically",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        "Search the full catalog by codename — there may still be a build for it.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                androidx.compose.material3.TextButton(onClick = onOpenDevices) {
+                    Text("Search")
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun QuickActionsGrid(
     onChecker: () -> Unit,
     onDevices: () -> Unit,
@@ -203,8 +504,8 @@ private fun QuickActionsGrid(
             ActionCard(Icons.Rounded.Smartphone, "Devices", "Browse supported phones", Modifier.weight(1f), onDevices)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            ActionCard(Icons.Rounded.Download, "Downloads", "Get OrangeFox builds", Modifier.weight(1f), onDownloads)
-            ActionCard(Icons.Rounded.NetworkCheck, "Bridge Health", "Ping OrangeFox servers", Modifier.weight(1f), onBridge)
+            ActionCard(Icons.Rounded.Download, "Downloads", "Track your downloads", Modifier.weight(1f), onDownloads)
+            ActionCard(Icons.Rounded.NetworkCheck, "Bridge Health", "Official server status", Modifier.weight(1f), onBridge)
         }
     }
 }
@@ -233,38 +534,6 @@ private fun ActionCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-        }
-    }
-}
-
-@Composable
-private fun StatsCard(deviceCount: Int, onOpenDevices: () -> Unit) {
-    Card(
-        onClick = onOpenDevices,
-        modifier = Modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.large
-    ) {
-        Row(
-            modifier = Modifier.padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Icon(
-                Icons.Rounded.Smartphone,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary
-            )
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    "$deviceCount devices available",
-                    style = MaterialTheme.typography.titleMedium
-                )
-                Text(
-                    "Cached catalog — refresh live from the Devices tab",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
         }
     }
 }
